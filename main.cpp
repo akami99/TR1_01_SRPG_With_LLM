@@ -1,4 +1,6 @@
 #define NOMINMAX // min, maxを使う時にWindowsの定義を無効化する
+#define WIN32_LEAN_AND_MEAN // Windowsヘッダーを軽量化
+#define _WINSOCKAPI_      // windows.h が winsock.h をインクルードするのを防ぐ
 
 #include <Novice.h>
 #include <iostream>
@@ -14,11 +16,126 @@
 #include <set>
 #include <tuple>
 #include <limits>
+#include <ctime> // 時間取得のために追加
 
 #include "externals/imgui/imgui.h"
 #include "externals/imgui/imgui_impl_dx12.h"
 #include "externals/imgui/imgui_impl_win32.h"
+
+// LLM通信用に追加
+#include "externals/nlohmann/json.hpp"
+#ifdef _WIN32
+#include <windows.h> // SetConsoleOutputCP, SetConsoleCtrlHandler のために必要
+#endif
+#include "externals/httplib.h"
+
 //---------------------------------
+
+// --- LLM関連の構造体と関数 (Ollamaプロジェクトからコピー) ---
+// Ollama APIとのメッセージ形式
+struct Message {
+	std::string role;
+	std::string content;
+};
+
+// Ollamaへのリクエストボディの構造
+struct OllamaChatRequest {
+	std::string model;
+	std::vector<Message> messages;
+	bool stream;
+};
+
+// Ollamaからの応答ボディの構造
+struct OllamaChatResponse {
+	std::string model;
+	std::string created_at;
+	Message message;
+	bool done;
+};
+
+// nlohmann/json を使って構造体をJSONに変換・から変換するためのヘルパー
+void to_json(nlohmann::json& j, const Message& m) {
+	j = nlohmann::json{ {"role", m.role}, {"content", m.content} };
+}
+void from_json(const nlohmann::json& j, Message& m) {
+	j.at("role").get_to(m.role);
+	j.at("content").get_to(m.content);
+}
+void to_json(nlohmann::json& j, const OllamaChatRequest& req) {
+	j = nlohmann::json{ {"model", req.model}, {"messages", req.messages}, {"stream", req.stream} };
+}
+void from_json(const nlohmann::json& j, OllamaChatResponse& res) {
+	j.at("model").get_to(res.model);
+	j.at("created_at").get_to(res.created_at);
+	j.at("message").get_to(res.message);
+	j.at("done").get_to(res.done);
+}
+
+// --- グローバル変数としてログファイルストリームとその他を宣言 ---
+// これにより、シグナルハンドラ関数からアクセスできるようになります。
+std::ofstream g_chatLogFile;
+std::ofstream g_gameLogFile; // デバッグ/リプレイログを想定
+std::vector<Message> g_conversationHistory; // 会話履歴もグローバルに
+httplib::Client* g_ollamaClient = nullptr; // Ollamaクライアントへのポインタ
+
+// --- フォルダ作成関数 (Ollamaプロジェクトからコピー) ---
+bool createDirectory(const std::string& path) {
+#ifdef _WIN32
+	int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, NULL, 0);
+	if (wlen == 0) return false;
+	std::vector<wchar_t> wpath(wlen);
+	MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+
+	if (!CreateDirectoryW(wpath.data(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+		std::cerr << "エラー: フォルダ '" << path << "' を作成できませんでした。エラーコード: " << GetLastError() << std::endl;
+		return false;
+	}
+	return true;
+#else
+	// POSIXシステム (Linux/macOS) の場合
+	// #include <sys/stat.h> が必要
+	// mkdir(path.c_str(), 0755); // 適切なパーミッションを設定
+	// return true; // 簡略化
+	// 環境によっては、より複雑なエラーチェックが必要です
+	std::cerr << "警告: フォルダ作成はWindows専用の実装です。\n";
+	return false;
+#endif
+}
+
+// --- コンソール制御ハンドラ関数 (Ollamaプロジェクトからコピー) ---
+BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
+	if (dwCtrlType == CTRL_C_EVENT ||
+		dwCtrlType == CTRL_BREAK_EVENT ||
+		dwCtrlType == CTRL_CLOSE_EVENT ||
+		dwCtrlType == CTRL_LOGOFF_EVENT ||
+		dwCtrlType == CTRL_SHUTDOWN_EVENT) {
+		if (g_chatLogFile.is_open()) {
+			g_chatLogFile << "\n--- 会話終了 (強制終了検出) ---\n\n";
+			g_chatLogFile.flush();
+			g_chatLogFile.close();
+		}
+		if (g_gameLogFile.is_open()) {
+			g_gameLogFile << "\n--- ゲームログ終了 (強制終了検出) ---\n\n";
+			g_gameLogFile.flush();
+			g_gameLogFile.close();
+		}
+		ExitProcess(0);
+	}
+	return FALSE;
+}
+
+// 現在のタイムスタンプを取得するヘルパー関数
+std::string getCurrentTimestamp() {
+	time_t rawtime;
+	struct tm timeinfo_struct;
+	char buffer[80];
+	time(&rawtime);
+	if (localtime_s(&timeinfo_struct, &rawtime) == 0) {
+		strftime(buffer, 80, "%Y%m%d_%H%M%S", &timeinfo_struct);
+		return buffer;
+	}
+	return "unknown_time";
+}
 
 struct Vector2 {
 	float x;
@@ -156,14 +273,127 @@ struct Unit {
 // ユニットの初期化
 std::vector<Unit> units = {
 	{"ally1", 9, 12, false, 20, 3, false, false, 7, 3, WeaponType::Sword},  // 味方ユニット
-	{"ally2", 6, 12, false, 15, 2, false, false, 5, 2, WeaponType::Bow},
+	//{"ally2", 6, 12, false, 15, 2, false, false, 5, 2, WeaponType::Bow},
 	{"enemy1", 6, 3, true, 20, 3, false, false, 7, 3, WeaponType::Sword},  // 敵ユニット
-	{"enemy2", 9, 3, true, 15, 2, false, false, 5, 2, WeaponType::Bow}
+	//{"enemy2", 9, 3, true, 15, 2, false, false, 5, 2, WeaponType::Bow}
 };
 
 int selected_unit_index = -1;  // 選択中のユニットインデックス
 std::set<std::pair<int, int>> current_move_range; // 現在の移動可能範囲(ユニットの移動力に基づく)
 std::set<std::pair<int, int>> current_attack_range; // 現在の攻撃可能範囲(ユニットの攻撃範囲に基づく)
+
+// ゲームの状態をAIプロンプトに変換する仮の関数
+// 実際のゲームの状態に合わせて詳細に記述する必要があります
+std::string getGameStateAsPrompt() {
+	std::string prompt = "Current game state:\n";
+	prompt += "Map size: " + std::to_string(MAP_SIZE) + "x" + std::to_string(MAP_SIZE) + "\n";
+	prompt += "Map layout (0=PLAIN, 1=FOREST):\n";
+	for (int y = 0; y < MAP_SIZE; ++y) {
+		for (int x = 0; x < MAP_SIZE; ++x) {
+			prompt += std::to_string(map[y][x]) + " ";
+		}
+		prompt += "\n";
+	}
+	prompt += "Units:\n";
+	for (const auto& u : units) {
+		prompt += "- " + u.name + (u.is_enemy ? " (Enemy)" : " (Ally)") +
+			" Pos: (" + std::to_string(u.x) + "," + std::to_string(u.y) + ")" +
+			" HP: " + std::to_string(u.hp) +
+			" ATK: " + std::to_string(u.atk) +
+			" DEF: " + std::to_string(u.def) +
+			" Moved: " + (u.has_moved ? "Yes" : "No") +
+			" Attacked: " + (u.has_attacked ? "Yes" : "No") +
+			" Weapon: " + (u.weapon == WeaponType::Sword ? "Sword" : "Bow") + "\n";
+	}
+	prompt += "Current phase: ";
+	if (current_phase == PlayerTurn) { // current_phase が enum PlayerTurn と比較可能であることを前提
+		prompt += "PlayerTurn";
+	} else if (current_phase == EnemyTurn) { // current_phase が enum EnemyTurn と比較可能であることを前提
+		prompt += "EnemyTurn";
+	} else {
+		prompt += "UnknownPhase"; // 予期せぬフェーズの場合のフォールバック
+	}
+	prompt += "\n";
+	prompt += "Your task is to provide the next action for an enemy unit. Choose one enemy unit, and one action: MOVE or ATTACK.\n";
+	prompt += "Format your response as a JSON object with 'unit_name', 'action_type', and 'target_x'/'target_y' or 'target_unit_name'.\n";
+	prompt += "Example MOVE: {\"unit_name\": \"enemy1\", \"action_type\": \"MOVE\", \"target_x\": 7, \"target_y\": 4}\n";
+	prompt += "Example ATTACK: {\"unit_name\": \"enemy1\", \"action_type\": \"ATTACK\", \"target_unit_name\": \"ally1\"}\n";
+	prompt += "Only provide the JSON object. Do not include any other text.\n";
+	return prompt;
+}
+
+// Ollamaにコマンドをリクエストし、応答を処理する関数
+std::string requestOllamaCommand() {
+	std::string game_state_prompt = getGameStateAsPrompt();
+
+	// AIへのプロンプトをチャットログとゲームログに記録
+	if (g_chatLogFile.is_open()) {
+		g_chatLogFile << "--- AI Request ---\n" << game_state_prompt << "\n";
+		g_chatLogFile.flush();
+	}
+	if (g_gameLogFile.is_open()) {
+		nlohmann::json log_entry;
+		log_entry["event"] = "AI_Prompt";
+		log_entry["timestamp"] = getCurrentTimestamp();
+		log_entry["prompt_content"] = game_state_prompt;
+		g_gameLogFile << log_entry.dump() << "\n";
+		g_gameLogFile.flush();
+	}
+
+	g_conversationHistory.push_back({ "user", game_state_prompt });
+
+	OllamaChatRequest request_data;
+	request_data.model = "phi3"; // 使用するモデル名
+	request_data.messages = g_conversationHistory;
+	request_data.stream = false;
+
+	nlohmann::json json_request = request_data;
+	std::string request_body = json_request.dump();
+
+	std::string ai_response_content = "";
+
+	if (g_ollamaClient) {
+		auto res = g_ollamaClient->Post("/api/chat", request_body, "application/json");
+
+		if (res && res->status == 200) {
+			try {
+				nlohmann::json json_response = nlohmann::json::parse(res->body);
+				OllamaChatResponse response_data = json_response.get<OllamaChatResponse>();
+
+				if (!response_data.message.content.empty()) {
+					ai_response_content = response_data.message.content;
+					// AIの応答をチャットログとゲームログに記録
+					if (g_chatLogFile.is_open()) {
+						g_chatLogFile << "--- AI Response ---\n" << ai_response_content << "\n";
+						g_chatLogFile.flush();
+					}
+					if (g_gameLogFile.is_open()) {
+						nlohmann::json log_entry;
+						log_entry["event"] = "AI_Response";
+						log_entry["timestamp"] = getCurrentTimestamp();
+						log_entry["response_content"] = ai_response_content;
+						g_gameLogFile << log_entry.dump() << "\n";
+						g_gameLogFile.flush();
+					}
+					g_conversationHistory.push_back({ "assistant", ai_response_content });
+				} else {
+					std::cerr << "(AIからの応答がありませんでした)\n";
+					if (g_chatLogFile.is_open()) g_chatLogFile << "(AIからの応答がありませんでした)\n";
+				}
+			} catch (const nlohmann::json::exception& e) {
+				std::cerr << "JSONパースエラー: " << e.what() << " - 受信データ: " << res->body << std::endl;
+				if (g_chatLogFile.is_open()) g_chatLogFile << "ERROR: JSON parse error: " << e.what() << "\n";
+			}
+		} else {
+			std::cerr << "HTTPリクエストエラー: " << (res ? std::to_string(res->status) : "接続失敗") << std::endl;
+			std::cerr << "Ollamaが起動しているか、またはAPIエンドポイントが正しいか確認してください。\n";
+			if (g_chatLogFile.is_open()) g_chatLogFile << "ERROR: HTTP request error: " << (res ? std::to_string(res->status) : "connection failed") << "\n";
+		}
+	} else {
+		std::cerr << "エラー: Ollamaクライアントが初期化されていません。\n";
+	}
+	return ai_response_content;
+}
 
 // ------------------------
 // ImGui関数
@@ -267,104 +497,90 @@ void end_player_turn() {
 
 // エネミーターンのロジック
 void enemy_turn_logic() {
-	for (auto& enemy : units) {
-		if (!enemy.is_enemy || enemy.hp <= 0) continue;
+	log("Enemy Turn Starts! Requesting AI command...");
+	std::string ai_command_json_str = requestOllamaCommand();
 
-		// 最も近いプレイヤーユニットを探す
-		int closest_dist = std::numeric_limits<int>::max();
-		Unit* target_unit = nullptr;
+	if (!ai_command_json_str.empty()) {
+		try {
+			nlohmann::json ai_command = nlohmann::json::parse(ai_command_json_str);
 
-		for (auto& ally : units) {
-			if (ally.is_enemy || ally.hp <= 0) continue;
-			int dist = std::abs(enemy.x - ally.x) + std::abs(enemy.y - ally.y);
-			if (dist < closest_dist) {
-				closest_dist = dist;
-				target_unit = &ally;
-			}
-		}
+			std::string unit_name = ai_command.at("unit_name").get<std::string>();
+			std::string action_type = ai_command.at("action_type").get<std::string>();
 
-		if (target_unit) {
-			// 射程内なら攻撃
-			int dx = std::abs(enemy.x - target_unit->x);
-			int dy = std::abs(enemy.y - target_unit->y);
-			int dist = dx + dy;
-			int min_r = enemy.min_range();
-			int max_r = enemy.max_range();
-			if (dist >= min_r && dist <= max_r) {
-				attack(enemy, *target_unit);
-				continue;
+			// AIが指示したユニットを見つける
+			Unit* target_enemy_unit = nullptr;
+			for (auto& u : units) {
+				if (u.is_enemy && u.name == unit_name && u.hp > 0) {
+					target_enemy_unit = &u;
+					break;
+				}
 			}
 
+			if (target_enemy_unit) {
+				if (action_type == "MOVE" && !target_enemy_unit->has_moved) {
+					int target_x = ai_command.at("target_x").get<int>();
+					int target_y = ai_command.at("target_y").get<int>();
 
-			// 移動可能なマスを全て洗い出す
-			std::set<std::pair<int, int>> possible_moves = get_move_range(enemy);
+					// AIが指示した移動が有効かチェック
+					std::set<std::pair<int, int>> possible_moves = get_move_range(*target_enemy_unit);
+					if (possible_moves.count({ target_x, target_y }) && !is_occupied(target_x, target_y)) {
+						target_enemy_unit->x = target_x;
+						target_enemy_unit->y = target_y;
+						target_enemy_unit->has_moved = true;
+						log(target_enemy_unit->name + " Moved to (" + std::to_string(target_x) + ", " + std::to_string(target_y) + ")");
+					} else {
+						log("AI attempted invalid MOVE for " + target_enemy_unit->name + " to (" + std::to_string(target_x) + ", " + std::to_string(target_y) + ")");
+					}
+				} else if (action_type == "ATTACK" && !target_enemy_unit->has_attacked) {
+					std::string target_unit_name = ai_command.at("target_unit_name").get<std::string>();
 
-			int best_move_x = enemy.x;
-			int best_move_y = enemy.y;
-			Unit* best_attack_target = nullptr; // 移動後に攻撃するターゲット
-			int max_potential_damage = -1; // 移動後に与えられる最大ダメージ
-
-			// 移動先の候補地を評価
-			for (const auto& move_pos : possible_moves) {
-				// 移動後の位置から攻撃できる敵を探す
-				// マンハッタン距離で判定
-
-				for (auto& ally : units) {
-					if (ally.is_enemy || ally.hp <= 0) continue;
-
-					int new_dx = std::abs(move_pos.first - ally.x);
-					int new_dy = std::abs(move_pos.second - ally.y);
-					int new_dist = new_dx + new_dy;
-
-					if (new_dist >= min_r && new_dist <= max_r) {
-						// 攻撃可能なターゲットが見つかった場合
-						int current_potential_damage = std::max(0, enemy.atk - ally.def);
-						if (current_potential_damage > max_potential_damage) {
-							max_potential_damage = current_potential_damage;
-							best_move_x = move_pos.first;
-							best_move_y = move_pos.second;
-							best_attack_target = &ally; // このターゲットを攻撃する
+					// AIが指示したターゲットユニットを見つける
+					Unit* target_ally_unit = nullptr;
+					for (auto& u : units) {
+						if (!u.is_enemy && u.name == target_unit_name && u.hp > 0) {
+							target_ally_unit = &u;
+							break;
 						}
 					}
-				}
-			}
 
-			// 最適な移動と攻撃を実行
-			if (best_attack_target && max_potential_damage > 0) { // 攻撃可能なユニットが見つかった場合
-				enemy.x = best_move_x;
-				enemy.y = best_move_y;
-				attack(enemy, *best_attack_target);
-			} else {
-				// 攻撃可能な場所が見つからなかった場合、ターゲットに近づく
-				// ターゲットまでの距離が最も短くなる1マス移動先を探す
-				int current_dist_to_target = std::abs(enemy.x - target_unit->x) + std::abs(enemy.y - target_unit->y);
-				int best_approach_x = enemy.x;
-				int best_approach_y = enemy.y;
-
-				const int dirs[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
-
-				for (auto& dir : dirs) {
-					int nx = enemy.x + dir[0];
-					int ny = enemy.y + dir[1];
-					if (!is_within_bounds(nx, ny)) continue;
-					// 敵ユニットの移動では、他のユニットが占拠していても通過できる（隣接マスへの移動のみ）
-					// is_occupiedチェックは不要かもしれないが、ここでは残す
-					if (!is_tile_passable(nx, ny) || is_occupied(nx, ny)) continue;
-
-					int new_dist_to_target = std::abs(nx - target_unit->x) + std::abs(ny - target_unit->y);
-					if (new_dist_to_target < current_dist_to_target) {
-						current_dist_to_target = new_dist_to_target;
-						best_approach_x = nx;
-						best_approach_y = ny;
+					if (target_ally_unit) {
+						// AIが指示した攻撃が有効かチェック
+						std::set<std::pair<int, int>> attack_range = get_attack_range(*target_enemy_unit);
+						if (attack_range.count({ target_ally_unit->x, target_ally_unit->y })) {
+							attack(*target_enemy_unit, *target_ally_unit);
+							target_enemy_unit->has_attacked = true;
+						} else {
+							log("AI attempted invalid ATTACK for " + target_enemy_unit->name + " on " + target_ally_unit->name + " (out of range)");
+						}
+					} else {
+						log("AI attempted to ATTACK unknown/defeated unit: " + target_unit_name);
 					}
+				} else {
+					log("AI provided invalid action type or unit already acted: " + action_type);
 				}
-				enemy.x = best_approach_x;
-				enemy.y = best_approach_y;
+			} else {
+				log("AI commanded unknown/defeated enemy unit: " + unit_name);
 			}
+
+		} catch (const nlohmann::json::exception& e) {
+			log("AI command JSON parse error: " + std::string(e.what()) + " - AI response: " + ai_command_json_str);
+		} catch (const std::exception& e) {
+			log("AI command processing error: " + std::string(e.what()));
+		}
+	} else {
+		log("No AI command received.");
+	}
+
+	// すべての敵ユニットが行動を終えるまで、または適切なターン終了条件まで待つ
+	// 今回はAIが1行動でターンを終える想定で簡略化
+	for (auto& u : units) {
+		if (u.is_enemy) { // 敵ユニットの状態をリセット
+			u.has_moved = false;
+			u.has_attacked = false;
 		}
 	}
-	for (auto& u : units) u.has_moved = u.has_attacked = false;
-	current_phase = PlayerTurn;
+	current_phase = PlayerTurn; // プレイヤーターンに戻す
+	log("Enemy Turn Ends!");
 }
 
 // マップとユニットを描画する関数
@@ -493,6 +709,42 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	// ライブラリの初期化
 	Novice::Initialize(kWindowTitle, 1280, 720);
 
+	// --- LLMとロギング関連の初期化ここから ---
+#ifdef _WIN32
+	SetConsoleOutputCP(CP_UTF8);
+	if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE)) {
+		std::cerr << "エラー: コンソール制御ハンドラの登録に失敗しました。\n";
+	}
+#endif
+
+	const std::string LOG_FOLDER = "logs";
+	if (!createDirectory(LOG_FOLDER)) {
+		std::cerr << "ログフォルダの準備に失敗しました。ログは保存されない可能性があります。\n";
+	}
+
+	std::string chat_log_filepath = LOG_FOLDER + "/chat_log.txt";
+	g_chatLogFile.open(chat_log_filepath, std::ios::app);
+	if (!g_chatLogFile.is_open()) {
+		std::cerr << "エラー: チャットログファイルを開けませんでした！\n";
+	} else {
+		g_chatLogFile << "\n--- 会話開始: " << getCurrentTimestamp() << " ---\n";
+		g_chatLogFile.flush();
+	}
+
+	// デバッグ/リプレイログはゲームのセッションごとに新しいファイルを作成することを推奨
+	std::string game_log_filepath = LOG_FOLDER + "/game_log_" + getCurrentTimestamp() + ".jsonl";
+	g_gameLogFile.open(game_log_filepath, std::ios::app); // JSONL形式を想定
+	if (!g_gameLogFile.is_open()) {
+		std::cerr << "エラー: ゲームログファイルを開けませんでした！\n";
+	} else {
+		g_gameLogFile << "{\"event\": \"GameSessionStart\", \"timestamp\": \"" << getCurrentTimestamp() << "\"}\n";
+		g_gameLogFile.flush();
+	}
+
+	// httplib::Client の初期化
+	g_ollamaClient = new httplib::Client("http://localhost:11434");
+	// --- LLMとロギング関連の初期化ここまで ---
+
 	// キー入力結果を受け取る箱
 	char keys[256] = {0};
 	char preKeys[256] = {0};
@@ -510,10 +762,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		/// ↓更新処理ここから
 		///
 
-		///----------------------------------------------------------------------------
-			/// TR1_LLM_SRPG用の設定
-			///----------------------------------------------------------------------------
-
+		// TR1_LLM_SRPG用の設定
 		RenderUI();
 
 		///
@@ -537,6 +786,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			break;
 		}
 	}
+
+	// --- LLMとロギング関連の終了処理ここから ---
+	if (g_chatLogFile.is_open()) {
+		g_chatLogFile << "\n--- 会話終了 (通常終了) ---\n\n";
+		g_chatLogFile.flush();
+		g_chatLogFile.close();
+	}
+	if (g_gameLogFile.is_open()) {
+		g_gameLogFile << "\n--- ゲームログ終了 (通常終了) ---\n\n";
+		g_gameLogFile.flush();
+		g_gameLogFile.close();
+	}
+	delete g_ollamaClient; // クライアントを解放
+	g_ollamaClient = nullptr;
+	// --- LLMとロギング関連の終了処理ここまで ---
 
 	// ライブラリの終了
 	Novice::Finalize();

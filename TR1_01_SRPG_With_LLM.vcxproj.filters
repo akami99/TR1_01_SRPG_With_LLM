@@ -14,6 +14,15 @@
     <Filter Include="KamataEngine\Adapter">
       <UniqueIdentifier>{c6468eb4-788b-4a83-b207-a5f4804e56c5}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Sources file">
+      <UniqueIdentifier>{7b2e1ca0-4aee-41ef-91e8-5b862d4ab9e4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Headers file">
+      <UniqueIdentifier>{fc9903a5-6f16-44c5-b75a-4b00787da2aa}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Externals">
+      <UniqueIdentifier>{3165d9e8-719f-4ce0-b3fd-f1e37db0dc66}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="C:\KamataEngine\DirectXGame\base\DirectXCommon.cpp">
@@ -28,7 +37,6 @@
     <ClCompile Include="C:\KamataEngine\DirectXGame\base\WinApp.cpp">
       <Filter>KamataEngine\Source</Filter>
     </ClCompile>
-    <ClCompile Include="main.cpp" />
     <ClCompile Include="C:\KamataEngine\Adapter\Novice.cpp">
       <Filter>KamataEngine\Adapter</Filter>
     </ClCompile>
@@ -37,6 +45,9 @@
     </ClCompile>
     <ClCompile Include="C:\KamataEngine\DirectXGame\base\StringUtility.cpp">
       <Filter>KamataEngine\Source</Filter>
+    </ClCompile>
+    <ClCompile Include="main.cpp">
+      <Filter>Sources file</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -110,6 +121,12 @@
     <ClInclude Include="C:\KamataEngine\DirectXGame\2d\ImGuiManager.h" />
     <ClInclude Include="C:\KamataEngine\DirectXGame\base\StringUtility.h">
       <Filter>KamataEngine\Include</Filter>
+    </ClInclude>
+    <ClInclude Include="externals\httplib.h">
+      <Filter>Externals</Filter>
+    </ClInclude>
+    <ClInclude Include="externals\nlohmann\json.hpp">
+      <Filter>Externals</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
