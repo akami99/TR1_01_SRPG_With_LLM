@@ -282,121 +282,18 @@ int selected_unit_index = -1;  // 選択中のユニットインデックス
 std::set<std::pair<int, int>> current_move_range; // 現在の移動可能範囲(ユニットの移動力に基づく)
 std::set<std::pair<int, int>> current_attack_range; // 現在の攻撃可能範囲(ユニットの攻撃範囲に基づく)
 
-// ゲームの状態をAIプロンプトに変換する仮の関数
-// 実際のゲームの状態に合わせて詳細に記述する必要があります
-std::string getGameStateAsPrompt() {
-	std::string prompt = "Current game state:\n";
-	prompt += "Map size: " + std::to_string(MAP_SIZE) + "x" + std::to_string(MAP_SIZE) + "\n";
-	prompt += "Map layout (0=PLAIN, 1=FOREST):\n";
-	for (int y = 0; y < MAP_SIZE; ++y) {
-		for (int x = 0; x < MAP_SIZE; ++x) {
-			prompt += std::to_string(map[y][x]) + " ";
-		}
-		prompt += "\n";
-	}
-	prompt += "Units:\n";
-	for (const auto& u : units) {
-		prompt += "- " + u.name + (u.is_enemy ? " (Enemy)" : " (Ally)") +
-			" Pos: (" + std::to_string(u.x) + "," + std::to_string(u.y) + ")" +
-			" HP: " + std::to_string(u.hp) +
-			" ATK: " + std::to_string(u.atk) +
-			" DEF: " + std::to_string(u.def) +
-			" Moved: " + (u.has_moved ? "Yes" : "No") +
-			" Attacked: " + (u.has_attacked ? "Yes" : "No") +
-			" Weapon: " + (u.weapon == WeaponType::Sword ? "Sword" : "Bow") + "\n";
-	}
-	prompt += "Current phase: ";
-	if (current_phase == PlayerTurn) { // current_phase が enum PlayerTurn と比較可能であることを前提
-		prompt += "PlayerTurn";
-	} else if (current_phase == EnemyTurn) { // current_phase が enum EnemyTurn と比較可能であることを前提
-		prompt += "EnemyTurn";
-	} else {
-		prompt += "UnknownPhase"; // 予期せぬフェーズの場合のフォールバック
-	}
-	prompt += "\n";
-	prompt += "Your task is to provide the next action for an enemy unit. Choose one enemy unit, and one action: MOVE or ATTACK.\n";
-	prompt += "Format your response as a JSON object with 'unit_name', 'action_type', and 'target_x'/'target_y' or 'target_unit_name'.\n";
-	prompt += "Example MOVE: {\"unit_name\": \"enemy1\", \"action_type\": \"MOVE\", \"target_x\": 7, \"target_y\": 4}\n";
-	prompt += "Example ATTACK: {\"unit_name\": \"enemy1\", \"action_type\": \"ATTACK\", \"target_unit_name\": \"ally1\"}\n";
-	prompt += "Only provide the JSON object. Do not include any other text.\n";
-	return prompt;
-}
-
-// Ollamaにコマンドをリクエストし、応答を処理する関数
-std::string requestOllamaCommand() {
-	std::string game_state_prompt = getGameStateAsPrompt();
-
-	// AIへのプロンプトをチャットログとゲームログに記録
-	if (g_chatLogFile.is_open()) {
-		g_chatLogFile << "--- AI Request ---\n" << game_state_prompt << "\n";
-		g_chatLogFile.flush();
-	}
-	if (g_gameLogFile.is_open()) {
-		nlohmann::json log_entry;
-		log_entry["event"] = "AI_Prompt";
-		log_entry["timestamp"] = getCurrentTimestamp();
-		log_entry["prompt_content"] = game_state_prompt;
-		g_gameLogFile << log_entry.dump() << "\n";
-		g_gameLogFile.flush();
-	}
-
-	g_conversationHistory.push_back({ "user", game_state_prompt });
-
-	OllamaChatRequest request_data;
-	request_data.model = "phi3"; // 使用するモデル名
-	request_data.messages = g_conversationHistory;
-	request_data.stream = false;
-
-	nlohmann::json json_request = request_data;
-	std::string request_body = json_request.dump();
-
-	std::string ai_response_content = "";
-
-	if (g_ollamaClient) {
-		auto res = g_ollamaClient->Post("/api/chat", request_body, "application/json");
-
-		if (res && res->status == 200) {
-			try {
-				nlohmann::json json_response = nlohmann::json::parse(res->body);
-				OllamaChatResponse response_data = json_response.get<OllamaChatResponse>();
-
-				if (!response_data.message.content.empty()) {
-					ai_response_content = response_data.message.content;
-					// AIの応答をチャットログとゲームログに記録
-					if (g_chatLogFile.is_open()) {
-						g_chatLogFile << "--- AI Response ---\n" << ai_response_content << "\n";
-						g_chatLogFile.flush();
-					}
-					if (g_gameLogFile.is_open()) {
-						nlohmann::json log_entry;
-						log_entry["event"] = "AI_Response";
-						log_entry["timestamp"] = getCurrentTimestamp();
-						log_entry["response_content"] = ai_response_content;
-						g_gameLogFile << log_entry.dump() << "\n";
-						g_gameLogFile.flush();
-					}
-					g_conversationHistory.push_back({ "assistant", ai_response_content });
-				} else {
-					std::cerr << "(AIからの応答がありませんでした)\n";
-					if (g_chatLogFile.is_open()) g_chatLogFile << "(AIからの応答がありませんでした)\n";
-				}
-			} catch (const nlohmann::json::exception& e) {
-				std::cerr << "JSONパースエラー: " << e.what() << " - 受信データ: " << res->body << std::endl;
-				if (g_chatLogFile.is_open()) g_chatLogFile << "ERROR: JSON parse error: " << e.what() << "\n";
-			}
-		} else {
-			std::cerr << "HTTPリクエストエラー: " << (res ? std::to_string(res->status) : "接続失敗") << std::endl;
-			std::cerr << "Ollamaが起動しているか、またはAPIエンドポイントが正しいか確認してください。\n";
-			if (g_chatLogFile.is_open()) g_chatLogFile << "ERROR: HTTP request error: " << (res ? std::to_string(res->status) : "connection failed") << "\n";
-		}
-	} else {
-		std::cerr << "エラー: Ollamaクライアントが初期化されていません。\n";
-	}
-	return ai_response_content;
-}
 
 // ------------------------
 // ImGui関数
+// ------------------------
+
+void log(const std::string& msg) {
+	combat_log.push_front(msg);
+	if (combat_log.size() > MAX_LOG_SIZE) combat_log.pop_back();
+}
+
+// ------------------------
+// SRPG関数
 // ------------------------
 
 // マップのサイズとタイルのサイズを基に、ウィンドウのクライアント領域を設定
@@ -456,11 +353,6 @@ std::set<std::pair<int, int>> get_attack_range(const Unit& unit) {
 	return result;
 }
 
-void log(const std::string& msg) {
-	combat_log.push_front(msg);
-	if (combat_log.size() > MAX_LOG_SIZE) combat_log.pop_back();
-}
-
 // ユニットを攻撃する関数
 void attack(Unit& attacker, Unit& target) {
 	int damage = std::max(0, attacker.atk - target.def);
@@ -495,92 +387,352 @@ void end_player_turn() {
 	current_phase = EnemyTurn;
 }
 
+// ゲームの状態をAIプロンプトに変換する仮の関数
+// 実際のゲームの状態に合わせて詳細に記述する必要がある
+std::string getGameStateAsPrompt(const Unit& acting_unit) {
+	std::string prompt = "Current game state:\n";
+	prompt += "Map size: " + std::to_string(MAP_SIZE) + "x" + std::to_string(MAP_SIZE) + "\n";
+	prompt += "Map layout (0=PLAIN, 1=FOREST):\n";
+	for (int y = 0; y < MAP_SIZE; ++y) {
+		for (int x = 0; x < MAP_SIZE; ++x) {
+			prompt += std::to_string(map[y][x]) + " ";
+		}
+		prompt += "\n";
+	}
+	// マップ情報やユニット位置が提示される部分、またはアクションの例の前に挿入するのが良い
+	prompt += "All coordinates for map positions (X, Y) are **0-indexed**, where (0,0) is the top-left corner of the map.\n";
+	
+	prompt += "Units:\n";
+	for (const auto& u : units) {
+		prompt += "- " + u.name + (u.is_enemy ? " (Enemy)" : " (Ally)") +
+			" Pos: (" + std::to_string(u.x) + "," + std::to_string(u.y) + ")" +
+			" HP: " + std::to_string(u.hp) +
+			" ATK: " + std::to_string(u.atk) +
+			" DEF: " + std::to_string(u.def) +
+			" Moved: " + (u.has_moved ? "Yes" : "No") +
+			" MoveRange: " + std::to_string(u.move) +
+			" Attacked: " + (u.has_attacked ? "Yes" : "No") +
+			" Weapon: " + (u.weapon == WeaponType::Sword ? "Sword" : "Bow") + 
+			" AttackRange: " + (u.weapon == WeaponType::Sword ? "1" : "2") + "\n";
+	}
+	prompt += "Current phase: ";
+	if (current_phase == PlayerTurn) { // current_phase が enum PlayerTurn と比較可能であることを前提
+		prompt += "PlayerTurn";
+	} else if (current_phase == EnemyTurn) { // current_phase が enum EnemyTurn と比較可能であることを前提
+		prompt += "EnemyTurn";
+	} else {
+		prompt += "UnknownPhase"; // 予期せぬフェーズの場合のフォールバック
+	}
+	prompt += "\n";
+
+	// 行動するユニットの可能なアクションをプロンプトに含める
+	prompt += "\nAll map positions (X, Y) are **strictly 0-indexed**, where (0,0) is the top-left corner. **DO NOT add 1 or any offset to these coordinates.**\n"; // 座標の厳密な定義とオフセットの禁止
+
+	prompt += "\nActions for " + acting_unit.name + " (from current position):\n";
+
+	// 可能な移動位置を計算し、プロンプトに追加
+	prompt += "  Possible MOVE locations (x,y): ";
+	std::set<std::pair<int, int>> move_range = get_move_range(acting_unit);
+	bool first_move_loc = true;
+	if (acting_unit.has_moved || move_range.empty()) {
+		prompt += "None (already moved or no valid moves)";
+	} else {
+		for (const auto& pos : move_range) {
+			if (!first_move_loc) prompt += ", ";
+			prompt += "(" + std::to_string(pos.first) + "," + std::to_string(pos.second) + ")";
+			first_move_loc = false;
+		}
+	}
+	prompt += "\n";
+
+	prompt += "When choosing a MOVE action:\n";
+	prompt += "  - You **MUST** select a 'target_x' and 'target_y' that is **EXACTLY** from the 'Possible MOVE locations' list. This list contains only valid and unoccupied cells reachable by your unit.\n"; // リストからの厳密な選択を再度強調
+	prompt += "  - The chosen target position **MUST be DIFFERENT from the unit's current position** and **MUST NOT be occupied by any other unit.** Moving to an occupied cell or your current cell is invalid and will fail.\n"; // 占有禁止と現在地禁止を明確に
+
+	// 攻撃可能なターゲットを計算し、プロンプトに追加
+	prompt += "  Possible ATTACK targets (unit_name): ";
+	std::set<std::pair<int, int>> attack_range_tiles = get_attack_range(acting_unit);
+	std::vector<std::string> attackable_unit_names;
+	for (const auto& u : units) { // グローバル変数 'units' を使用
+		if (!u.is_enemy && u.hp > 0) { // 敵ではない（味方）ユニットで、HPが0より大きい
+			// 攻撃射程内にいるか確認
+			if (attack_range_tiles.count({ u.x, u.y })) {
+				attackable_unit_names.push_back(u.name);
+			}
+		}
+	}
+	bool first_attack_target = true;
+	if (acting_unit.has_attacked || attackable_unit_names.empty()) {
+		prompt += "None (already attacked or no valid targets)";
+	} else {
+		for (const auto& target_name : attackable_unit_names) {
+			if (!first_attack_target) prompt += ", ";
+			prompt += target_name;
+			first_attack_target = false;
+		}
+	}
+	prompt += "\n";
+
+	prompt += "\nYour task is to provide the next action(s) for " + acting_unit.name + " to **aggressively and strategically defeat ally units**. Your goal is their complete elimination.\n"; // より攻撃的な目標を明示
+	prompt += "A unit can perform up to two actions in a turn: one MOVE and one ATTACK. You can choose to perform these actions in any order, or only one action. If you perform a MOVE, the ATTACK (if any) will be from the unit's new position after moving.\n";
+
+	prompt += "**Strategic Action Guidelines (Prioritized):**\n"; // 優先順位を強調
+	prompt += "1. **ABSOLUTE PRIORITY: ATTACK IF POSSIBLE.** If *any* ally unit is within your attack range (from your current position or a reachable move position), you **MUST** prioritize attacking them. Choose the target that can be defeated or deals the most damage. **Do NOT move if it prevents an immediate attack.**\n"; // 攻撃の最優先を強調
+	prompt += "2. **INITIATE COMBAT:** If no ally is currently in your attack range:\n";
+	prompt += "   - **Maximize your movement to get into attack range of an ally in THIS turn.** If you cannot attack this turn, then **maximize your movement to get into attack range for the NEXT turn.**\n"; // 攻撃範囲への移動の最大化を強調
+	prompt += "   - When moving, evaluate all 'Possible MOVE locations'. Select the one that **most effectively closes the distance to the closest enemy**, ensuring you can attack this turn or next.\n";
+	prompt += "   - **Additionally, consider cutting off escape routes or cornering enemy units if it leads to a quicker defeat.**\n"; // 追撃と囲い込みを促進
+	prompt += "   - **Avoid moving into an enemy's attack range if you cannot attack them this turn.**\n";
+	prompt += "3. **OPTIMAL ENGAGEMENT:**\n";
+	prompt += "   - If an ally is in your attack range and you have moves remaining after attacking, consider moving to a safer position *only if* it doesn't prevent you from attacking a new target next turn or puts you out of harm's way significantly. **Ensure your chosen move maintains offensive pressure.**\n"; // 攻撃後の移動に関するガイダンス
+	
+	prompt += "4. **ACTION IMPERATIVE: Always attempt to perform an action (MOVE or ATTACK) if a valid and strategically beneficial one exists.** Only skip your turn (perform no actions) as a last resort, when absolutely no beneficial MOVE or ATTACK is possible and waiting is the only option.\n"; // 行動の強制と待機（スキップ）の抑制
+
+	prompt += "You must only choose actions that are valid based on the unit's current state and rules.\n";
+	prompt += "Specifically, for MOVE actions, the **'target_x' and 'target_y' MUST be chosen DIRECTLY from the provided 'Possible MOVE locations' list. DO NOT generate new coordinates not in that list.**\n"; // リストからの直接選択を強制
+	prompt += "Format your response as a **SINGLE JSON array** of action objects. Do NOT include any text or commas outside this single array. Your response must start with '[' and end with ']'.\n"; // 「SINGLE JSON array」と外部カンマ禁止を再強調
+
+	prompt += "Example single MOVE: [{\"unit_name\": \"" + acting_unit.name + "\", \"action_type\": \"MOVE\", \"target_x\": X, \"target_y\": Y}]\n";
+	prompt += "Example single ATTACK: [{\"unit_name\": \"" + acting_unit.name + "\", \"action_type\": \"ATTACK\", \"target_unit_name\": \"TARGET_NAME\"}]\n";
+	prompt += "Example ATTACK then MOVE: [{\"unit_name\": \"" + acting_unit.name + "\", \"action_type\": \"ATTACK\", \"target_unit_name\": \"TARGET_NAME\"}, {\"unit_name\": \"" + acting_unit.name + "\", \"action_type\": \"MOVE\", \"target_x\": X, \"target_y\": Y}]\n";
+	prompt += "Example MOVE then ATTACK: [{\"unit_name\": \"" + acting_unit.name + "\", \"action_type\": \"MOVE\", \"target_x\": X, \"target_y\": Y}, {\"unit_name\": \"" + acting_unit.name + "\", \"action_type\": \"ATTACK\", \"target_unit_name\": \"TARGET_NAME\"}]\n";
+	prompt += "Only provide the JSON array. Do not include any other text, comments, or explanations whatsoever. Your response must start with '[' and end with ']'.\n";
+
+	return prompt;
+}
+
+// 文字列の前後の空白文字をトリムするヘルパー関数
+std::string trim_whitespace(const std::string& str) {
+	size_t first = str.find_first_not_of(" \t\n\r\f\v");
+	if (std::string::npos == first) {
+		return str; // 空白のみの文字列
+	}
+	size_t last = str.find_last_not_of(" \t\n\r\f\v");
+	return str.substr(first, (last - first + 1));
+}
+
+// Ollamaにコマンドをリクエストし、応答を処理する関数
+std::string requestOllamaCommand(const Unit& acting_unit) {
+	std::string game_state_prompt = getGameStateAsPrompt(acting_unit);
+
+	// AIへのプロンプトをチャットログとゲームログに記録
+	if (g_chatLogFile.is_open()) {
+		g_chatLogFile << "--- AI Request ---\n" << game_state_prompt << "\n";
+		g_chatLogFile.flush();
+	}
+	if (g_gameLogFile.is_open()) {
+		nlohmann::json log_entry;
+		log_entry["event"] = "AI_Prompt";
+		log_entry["timestamp"] = getCurrentTimestamp();
+		log_entry["prompt_content"] = game_state_prompt;
+		g_gameLogFile << log_entry.dump() << "\n";
+		g_gameLogFile.flush();
+	}
+
+	g_conversationHistory.push_back({ "user", game_state_prompt });
+
+	OllamaChatRequest request_data;
+	request_data.model = "phi3"; // 使用するモデル名
+	request_data.messages = g_conversationHistory;
+	request_data.stream = false;
+
+	nlohmann::json json_request = request_data;
+	std::string request_body = json_request.dump();
+
+	std::string ai_response_content = "";
+
+	if (g_ollamaClient) {
+		auto res = g_ollamaClient->Post("/api/chat", request_body, "application/json");
+
+		if (res && res->status == 200) {
+			try {
+				nlohmann::json json_response = nlohmann::json::parse(res->body);
+				OllamaChatResponse response_data = json_response.get<OllamaChatResponse>();
+
+				if (!response_data.message.content.empty()) {
+					// AIの応答内容を ai_response_content に代入する
+					ai_response_content = response_data.message.content;
+					
+					// AIの応答から余分なマークダウンや空白文字をトリムする
+					// 前後の空白や改行を削除
+					ai_response_content = trim_whitespace(ai_response_content);
+					
+					// '```json' と '```' を削除
+					std::string json_start_marker = "```json";
+					std::string json_end_marker = "```";
+					
+					size_t start_pos = ai_response_content.find(json_start_marker);
+					if (start_pos != std::string::npos) {
+						// 開始マーカーが見つかった場合
+						ai_response_content.erase(start_pos, json_start_marker.length());
+
+						// 終了マーカーを探す
+						size_t end_pos = ai_response_content.find(json_end_marker);
+						if (end_pos != std::string::npos) {
+							ai_response_content.erase(end_pos, json_end_marker.length());
+						}
+					}
+					// ここでもう一度トリムして、マークダウン削除後の余分な空白や改行を削除
+					ai_response_content = trim_whitespace(ai_response_content);
+
+					// AIが '[{"action1"}], [{"action2"}]' のように複数配列を生成するエラーを修正
+					// '], [' を ', ' に置換し、単一の有効なJSON配列になるようにする
+					std::string search_pattern = "], [";
+					size_t found_pos = ai_response_content.find(search_pattern);
+					if (found_pos != std::string::npos) {
+						ai_response_content.replace(found_pos, search_pattern.length(), ", ");
+						// 置換後に再度トリムして、余分な空白を削除
+						ai_response_content = trim_whitespace(ai_response_content);
+						log("Fixed malformed JSON: replaced '], [' with ', '."); // 修正をログに記録
+					}
+
+					// AIの応答をチャットログとゲームログに記録
+					if (g_chatLogFile.is_open()) {
+						g_chatLogFile << "--- AI Response ---\n" << ai_response_content << "\n";
+						g_chatLogFile.flush();
+					}
+					if (g_gameLogFile.is_open()) {
+						nlohmann::json log_entry;
+						log_entry["event"] = "AI_Response";
+						log_entry["timestamp"] = getCurrentTimestamp();
+						log_entry["response_content"] = ai_response_content;
+						g_gameLogFile << log_entry.dump() << "\n";
+						g_gameLogFile.flush();
+					}
+					g_conversationHistory.push_back({ "assistant", ai_response_content });
+				} else {
+					std::cerr << "(AIからの応答がありませんでした)\n";
+					if (g_chatLogFile.is_open()) g_chatLogFile << "(AIからの応答がありませんでした)\n";
+				}
+			} catch (const nlohmann::json::exception& e) {
+				std::cerr << "JSONパースエラー: " << e.what() << " - 受信データ: " << res->body << std::endl;
+				if (g_chatLogFile.is_open()) g_chatLogFile << "ERROR: JSON parse error: " << e.what() << "\n";
+			}
+		} else {
+			std::cerr << "HTTPリクエストエラー: " << (res ? std::to_string(res->status) : "接続失敗") << std::endl;
+			std::cerr << "Ollamaが起動しているか、またはAPIエンドポイントが正しいか確認してください。\n";
+			if (g_chatLogFile.is_open()) g_chatLogFile << "ERROR: HTTP request error: " << (res ? std::to_string(res->status) : "connection failed") << "\n";
+		}
+	} else {
+		std::cerr << "エラー: Ollamaクライアントが初期化されていません。\n";
+	}
+	return ai_response_content;
+}
+
 // エネミーターンのロジック
 void enemy_turn_logic() {
-	log("Enemy Turn Starts! Requesting AI command...");
-	std::string ai_command_json_str = requestOllamaCommand();
+	for (auto& enemy : units) {
+		if (!enemy.is_enemy || enemy.hp <= 0) continue; // 敵ユニットかつ生存している場合のみ
 
-	if (!ai_command_json_str.empty()) {
+		// AIからのコマンドをリクエスト
+		log("Enemy Turn Starts! Requesting AI command...");
+		std::string ai_command_json_str = requestOllamaCommand(enemy);
+
+		if (ai_command_json_str.empty()) {
+			log("not AI command");
+			continue;
+		}
+
 		try {
-			nlohmann::json ai_command = nlohmann::json::parse(ai_command_json_str);
+			// ★ 変更: AIの応答をJSON配列としてパースする
+			nlohmann::json ai_actions = nlohmann::json::parse(ai_command_json_str);
 
-			std::string unit_name = ai_command.at("unit_name").get<std::string>();
-			std::string action_type = ai_command.at("action_type").get<std::string>();
-
-			// AIが指示したユニットを見つける
-			Unit* target_enemy_unit = nullptr;
-			for (auto& u : units) {
-				if (u.is_enemy && u.name == unit_name && u.hp > 0) {
-					target_enemy_unit = &u;
-					break;
-				}
+			if (!ai_actions.is_array()) {
+				log(enemy.name + ": AI command was not a JSON array, skipping.");
+				continue; // 配列でない場合はエラーとして次のユニットへ
 			}
 
-			if (target_enemy_unit) {
-				if (action_type == "MOVE" && !target_enemy_unit->has_moved) {
-					int target_x = ai_command.at("target_x").get<int>();
-					int target_y = ai_command.at("target_y").get<int>();
+			// AIから指示された各アクションを順番に処理する
+			for (const auto& action : ai_actions) {
+				// 各アクションオブジェクトが必須キーを持っているか確認
+				if (!action.contains("unit_name") || !action.contains("action_type")) {
+					log(enemy.name + ": AI command action is missing required key, skipping.");
+					continue; // 必須キーがなければスキップ
+				}
 
-					// AIが指示した移動が有効かチェック
-					std::set<std::pair<int, int>> possible_moves = get_move_range(*target_enemy_unit);
-					if (possible_moves.count({ target_x, target_y }) && !is_occupied(target_x, target_y)) {
-						target_enemy_unit->x = target_x;
-						target_enemy_unit->y = target_y;
-						target_enemy_unit->has_moved = true;
-						log(target_enemy_unit->name + " Moved to (" + std::to_string(target_x) + ", " + std::to_string(target_y) + ")");
-					} else {
-						log("AI attempted invalid MOVE for " + target_enemy_unit->name + " to (" + std::to_string(target_x) + ", " + std::to_string(target_y) + ")");
+				std::string unit_name = action.at("unit_name").get<std::string>();
+				std::string action_type = action.at("action_type").get<std::string>();
+
+				// コマンド対象のユニットが現在の敵ユニットと一致するか確認
+				if (unit_name != enemy.name) {
+					log(enemy.name + ": AI commanded unit name does not match current enemy unit: " + unit_name + ". Skip.");
+					continue; // 別のユニットへの指示であればスキップ
+				}
+
+				if (action_type == "MOVE") {
+					if (enemy.has_moved) {
+						log(enemy.name + ": Skipping MOVE because already moved.");
+						continue;
 					}
-				} else if (action_type == "ATTACK" && !target_enemy_unit->has_attacked) {
-					std::string target_unit_name = ai_command.at("target_unit_name").get<std::string>();
+					if (!action.contains("target_x") || !action.contains("target_y")) {
+						log(enemy.name + ": Missing target_x/y in MOVE action. Skipping.");
+						continue;
+					}
+					int target_x = action.at("target_x").get<int>();
+					int target_y = action.at("target_y").get<int>();
 
-					// AIが指示したターゲットユニットを見つける
-					Unit* target_ally_unit = nullptr;
-					for (auto& u : units) {
-						if (!u.is_enemy && u.name == target_unit_name && u.hp > 0) {
-							target_ally_unit = &u;
+					// 移動範囲のチェックと移動の実行
+					std::set<std::pair<int, int>> move_range = get_move_range(enemy);
+					if (move_range.count({ target_x, target_y }) && !is_occupied(target_x, target_y)) {
+						enemy.x = target_x; // ユニットの実際の位置を更新
+						enemy.y = target_y;
+						enemy.has_moved = true; // 移動フラグを立てる
+						log(enemy.name + " moved to (" + std::to_string(target_x) + ", " + std::to_string(target_y) + ")");
+						// 移動後、enemyオブジェクトの位置が更新されるため、後続のATTACKアクションはこの新しい位置から計算される
+					} else {
+						log(enemy.name + " could not be moved to the specified position: (" + std::to_string(target_x) + ", " + std::to_string(target_y) + "). Skip.");
+					}
+				} else if (action_type == "ATTACK") {
+					if (enemy.has_attacked) {
+						log(enemy.name + ": Since an attack has already been performed, ATTACK is skipped.");
+						continue;
+					}
+					if (!action.contains("target_unit_name")) {
+						log(enemy.name + ": Missing target_unit_name in ATTACK action. Skip.");
+						continue;
+					}
+					std::string target_unit_name = action.at("target_unit_name").get<std::string>();
+
+					// ターゲットユニットを探す
+					Unit* target_unit = nullptr;
+					for (auto& ally : units) {
+						// 敵ではない（味方）ユニットで、名前が一致し、かつHPが0より大きい（生存している）
+						if (!ally.is_enemy && ally.name == target_unit_name && ally.hp > 0) {
+							target_unit = &ally;
 							break;
 						}
 					}
 
-					if (target_ally_unit) {
-						// AIが指示した攻撃が有効かチェック
-						std::set<std::pair<int, int>> attack_range = get_attack_range(*target_enemy_unit);
-						if (attack_range.count({ target_ally_unit->x, target_ally_unit->y })) {
-							attack(*target_enemy_unit, *target_ally_unit);
-							target_enemy_unit->has_attacked = true;
+					if (target_unit) {
+						// 攻撃範囲のチェックは、現在のユニット位置 (移動後であればその位置) から行われる
+						std::set<std::pair<int, int>> attack_range = get_attack_range(enemy); // enemyの現在の位置 (移動後であればその位置) から計算
+						if (attack_range.count({ target_unit->x, target_unit->y })) {
+							attack(enemy, *target_unit); // 攻撃実行
+							enemy.has_attacked = true; // 攻撃フラグを立てる
 						} else {
-							log("AI attempted invalid ATTACK for " + target_enemy_unit->name + " on " + target_ally_unit->name + " (out of range)");
+							log(enemy.name + " failed to attack " + target_unit_name + " out of range, skipping.");
 						}
 					} else {
-						log("AI attempted to ATTACK unknown/defeated unit: " + target_unit_name);
+						log(enemy.name + " Units with specified " + target_unit_name + " Failed to attack: Target not found or not alive. Skipping.");
 					}
 				} else {
-					log("AI provided invalid action type or unit already acted: " + action_type);
+					log(enemy.name + ": Unknown AI action type: " + action_type + ". Skip.");
 				}
-			} else {
-				log("AI commanded unknown/defeated enemy unit: " + unit_name);
-			}
+			} // 各アクションのループ終了
 
 		} catch (const nlohmann::json::exception& e) {
-			log("AI command JSON parse error: " + std::string(e.what()) + " - AI response: " + ai_command_json_str);
+			log(enemy.name + ": JSON parsing error in AI command: " + std::string(e.what()) + " - Received Data: " + ai_command_json_str);
 		} catch (const std::exception& e) {
-			log("AI command processing error: " + std::string(e.what()));
+			log(enemy.name + ": Unexpected error while processing AI command: " + std::string(e.what()));
 		}
-	} else {
-		log("No AI command received.");
 	}
 
-	// すべての敵ユニットが行動を終えるまで、または適切なターン終了条件まで待つ
-	// 今回はAIが1行動でターンを終える想定で簡略化
+	// 全てのユニットの行動フラグをリセットしてターン終了
 	for (auto& u : units) {
-		if (u.is_enemy) { // 敵ユニットの状態をリセット
-			u.has_moved = false;
-			u.has_attacked = false;
-		}
+		u.has_moved = false;
+		u.has_attacked = false;
 	}
-	current_phase = PlayerTurn; // プレイヤーターンに戻す
-	log("Enemy Turn Ends!");
+	current_phase = PlayerTurn; // プレイヤーターンへ移行
 }
 
 // マップとユニットを描画する関数
